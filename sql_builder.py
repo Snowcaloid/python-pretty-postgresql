@@ -2,13 +2,11 @@ from __future__ import annotations
 from abc import abstractmethod
 from datetime import datetime
 from enum import Enum
-from os import getenv
 from typing import List, Self, Tuple, Union, get_type_hints, override
 
+from config import SQL_ENABLE_CUSTOM_HANDLING, SQL_TABLE_ALIAS_NEEDS_AS
 from utils import filter_empty
 
-SQL_ENABLE_CUSTOM_HANDLING = getenv('SQL_ENABLE_CUSTOM_HANDLING') or False
-SQL_TABLE_ALIAS_NEEDS_AS = getenv('SQL_TABLE_ALIAS_NEEDS_AS') or False
 
 def timestamp_string(timestamp: datetime):
     return timestamp.strftime("\'%Y-%m-%d %H:%M:%S\'")
