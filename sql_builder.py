@@ -114,13 +114,29 @@ class SQLKeyword(Enum):
     VALUES = 'VALUES'
     VIEW = 'VIEW'
     WHERE = 'WHERE'
+    OFFSET = 'OFFSET'
+    PERCENT = 'PERCENT'
+    REFERENCES = 'REFERENCES'
+    IF_NOT_EXISTS = 'IF NOT EXISTS'
+    IF_EXISTS = 'IF EXISTS'
+    RENAME_COLUMN = 'RENAME COLUMN'
 
-JoinKeyWords = [
+SQLJoinKeyWords = [
     SQLKeyword.INNER_JOIN,
     SQLKeyword.OUTER_JOIN,
     SQLKeyword.LEFT_JOIN,
     SQLKeyword.RIGHT_JOIN,
     SQLKeyword.FULL_OUTER_JOIN
+]
+
+SQLColumnConstraints = [
+    SQLKeyword.PRIMARY_KEY,
+    SQLKeyword.NOT_NULL,
+    SQLKeyword.UNIQUE,
+    SQLKeyword.CHECK,
+    SQLKeyword.DEFAULT,
+    SQLKeyword.FOREIGN_KEY,
+    SQLKeyword.REFERENCES
 ]
 
 KW = SQLKeyword
@@ -169,7 +185,14 @@ class SQLExpression:
         return SQLLogicalExpression(self, KW.OR.value, other)
 
     def __invert__(self) -> SQLLogicalExpression:
-        return SQLLogicalExpression(self, KW.NOT.value, self)
+        return SQLLogicalExpression(self, KW.NOT.value)
+
+    def _in(self, other: SQLExpression) -> SQLEquation:
+        if isinstance(other, SQLStatement):
+            other.compile()
+        if isinstance(other, SQLSelect) and other.alias is None:
+            other.value = f'({other.value})'
+        return SQLEquation(self, KW.IN.value, other)
 
 class SQLEquation(SQLExpression):
     def expression_type(self) -> SQLExpressionType: return SQLExpressionType.EQUATION
@@ -258,6 +281,7 @@ class SQLStatement:
         else:
             raise ValueError(f'SQL Value {value} of type not convertable into string')
 
+
 class SQLSelectField(SQLStatement):
     @override
     def compile(self) -> str:
@@ -273,7 +297,7 @@ SQLOrderByLiteral = Union[Union[SQLField, SQLAlias], Tuple[Union[SQLField, SQLAl
 
 class SQLJoin:
     def __init__(self, table: Union[str, Tuple[str,str]], on: SQLEquation, join_type: SQLKeyword = SQLKeyword.INNER_JOIN):
-        if not join_type in JoinKeyWords: raise ValueError(f'{join_type.value} is not a valid join keyword.')
+        if not join_type in SQLJoinKeyWords: raise ValueError(f'{join_type.value} is not a valid join keyword.')
         self.table = table
         self.on = on
         self.join_type = join_type
@@ -284,7 +308,7 @@ class SQLJoin:
 
 class SQLSelect(SQLStatement):
     @ensure_type(SQLAlias)
-    def __init__(self, alias: SQLAlias = None):
+    def __init__(self, distinct: bool = None, alias: SQLAlias = None):
         super().__init__(expression=SQLExpression(None), alias=alias)
         self._fields: List[SQLSelectField] = []
         self._table: str = None
@@ -293,7 +317,12 @@ class SQLSelect(SQLStatement):
         self._order_by: List[SQLOrderByLiteral] = []
         self._joins: List[SQLJoin] = []
         self._limit = None
+        self._offset = None
         self._top_limit = None
+        self._top_percent = None
+        self._distinct = distinct
+        self._group_by: List[SQLExpression] = []
+        self._having: SQLExpression = None
 
     def fields(self, _fields: List[SQLSelectField]) -> Self:
         self._fields = self._fields + _fields
@@ -330,16 +359,20 @@ class SQLSelect(SQLStatement):
         self._joins.append(SQLJoin(table, on, join_type))
         return self
 
-    def limit(self, limit: int) -> Self:
+    def limit(self, limit: int, offset: int = None) -> Self:
         self._limit = limit
+        self._offset = offset
         return self
 
-    def top(self, limit: int) -> Self:
+    def top(self, limit: int, top_percent: bool = None) -> Self:
         self._top_limit = limit
+        self._top_percent = top_percent
         return self
 
-    def group_by(self, fields: List[SQLExpression]) -> Self:
+    @ensure_type(SQLExpression)
+    def group_by(self, fields: List[SQLExpression], having: SQLExpression = None) -> Self:
         self._group_by = fields
+        self._having = having
         return self
 
     def compile(self) -> str:
@@ -355,9 +388,14 @@ class SQLSelect(SQLStatement):
         group_by = ''
         if self._group_by:
             group_by = KW.GROUP_BY.value + ' ' + ', '.join(expr.compile() if isinstance(expr, SQLStatement) else expr.value for expr in self._group_by)
+        having = ''
+        if self._having:
+            having = KW.HAVING.value + ' ' + self._having.value
         result = filter_empty([
             KW.SELECT.value,
-            KW.TOP.value if self._top_limit else '',
+            KW.DISTINCT.value if self._distinct else '',
+            f'{KW.TOP.value} {self._top_limit}' if self._top_limit else '',
+            KW.PERCENT.value if self._top_percent else '',
             ', '.join(field.compile() for field in self._fields),
             KW.FROM.value,
             self._table,
@@ -365,10 +403,80 @@ class SQLSelect(SQLStatement):
             ' '.join(join.compile() for join in self._joins),
             where,
             group_by,
+            having,
             order_by,
-            f'{KW.LIMIT.value} {self._limit}' if self._limit else ''
+            f'{KW.LIMIT.value} {self._limit}' if self._limit else '',
+            f'{KW.OFFSET.value} {self._offset}' if self._offset and self._limit else ''
         ])
-        result = ' '.join(result)
+        result = ' '.join([part.compile() if isinstance(part, SQLStatement) else part for part in result])
         if self.alias:
             result = f'({result}) {KW.AS.value + ' ' if SQL_TABLE_ALIAS_NEEDS_AS else ''}{self.alias.value}'
-        return result
+
+        self.value = result
+        return self.value
+
+class SQLColumnConstraint(SQLExpression):
+    @ensure_type(SQLKeyword, SQLExpression)
+    def __init__(self, name: str, constraint: SQLKeyword, value: SQLExpression):
+        if not constraint in SQLColumnConstraints: raise ValueError(f'{constraint.value} is not a valid column constraint.')
+        self.value = f'{KW.CONSTRAINT.value} {name} {constraint.value} {value.value}'
+
+class SQLColumnForeignKey(SQLColumnConstraint):
+    @ensure_type(SQLField, SQLTable)
+    def __init__(self, name: str, column: SQLField, table: SQLTable, reference_column: SQLField):
+        self.value = f'{KW.CONSTRAINT.value} {name} {KW.FOREIGN_KEY.value} ({column.value}) {KW.REFERENCES.value} {table.value} ({reference_column.value})'
+
+class SQLTableColumn(SQLExpression):
+    def __init__(self, name: str, data_type: str, constraints: List[SQLColumnConstraint] = []):
+        constraints = ", ".join([constraint.value for constraint in constraints])
+        if constraints:
+            constraints = f', {constraints}'
+        self.value = f'{name} {data_type}{constraints}'
+
+class SQLCreateTable(SQLStatement):
+    def __init__(self, table_name: str, columns: List[SQLTableColumn], insecure: bool = False):
+        super().__init__(SQLExpression(None))
+        self.table_name = table_name
+        self.columns = columns
+        self.insecure = insecure
+
+    def compile(self) -> str:
+        columns = ', '.join([column.value for column in self.columns])
+        insecure = ' ' + KW.IF_NOT_EXISTS.value if self.insecure else ''
+        self.value = f'{KW.CREATE_TABLE.value}{insecure} {self.table_name} ({columns})'
+        return self.value
+
+class SQLDropTableColumn(SQLTableColumn):
+    def __init__(self, column_name: str, insecure: bool = False):
+        insecure = ' ' + KW.IF_EXISTS.value if insecure else ''
+        self.value = f'{KW.DROP_COLUMN.value} {column_name}'
+
+
+class SQLAlterTable(SQLStatement):
+    def __init__(self, table_name: str):
+        super().__init__(SQLExpression(None))
+        self.table_name = table_name
+
+    def add_column(self, name: str, data_type: str, insecure: bool = False) -> str:
+        insecure = ' ' + KW.IF_NOT_EXISTS.value if insecure else ''
+        return f'{KW.ALTER_TABLE.value} {self.table_name} {KW.ADD.value} {KW.COLUMN.value}{insecure} {name} {data_type}'
+
+    def alter_column(self, name: str, data_type: str, insecure: bool = False) -> str:
+        insecure = ' ' + KW.IF_EXISTS.value if insecure else ''
+        return f'{KW.ALTER_TABLE.value} {self.table_name} {KW.ALTER_COLUMN.value}{insecure} {name} {data_type}'
+
+    def drop_column(self, name: str, insecure: bool = False) -> str:
+        insecure = ' ' + KW.IF_EXISTS.value if insecure else ''
+        return f'{KW.ALTER_TABLE.value} {self.table_name} {KW.DROP_COLUMN.value}{insecure} {name}'
+
+    def rename_column(self, old_name: str, new_name: str) -> str:
+        return f'{KW.ALTER_TABLE.value} {self.table_name} {KW.RENAME_COLUMN.value} {old_name} TO {new_name}'
+
+    def add_constraint(self, constraint: SQLColumnConstraint) -> str:
+        return f'{KW.ALTER_TABLE.value} {self.table_name} {KW.ADD.value} {constraint.value}'
+
+    def drop_constraint(self, name: str, insecure: bool = False) -> str:
+        insecure = ' ' + KW.IF_EXISTS.value if insecure else ''
+        return f'{KW.ALTER_TABLE.value} {self.table_name} {KW.DROP_CONSTRAINT.value}{insecure} {name}'
+
+
